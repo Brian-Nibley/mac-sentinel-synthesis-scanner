@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local run output, if generated inside the repo instead of ~/MacSentinelSynthesisScanner
+/demo.html
+/reports/
+/state/
