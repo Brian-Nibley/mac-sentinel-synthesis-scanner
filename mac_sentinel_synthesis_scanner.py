@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Mac Sentinel Synthesis Scanner — daily macOS security report for STANDARD
-(non-admin) accounts.
+(non-admin) accounts. Administrators can get a couple of deeper checks by running
+`report`/`sample` (only those two — not `install`/`uninstall`) with sudo; see the
+README's "Running as an administrator" section.
 
-No sudo, no third-party packages, no network calls. Works with the python3 that
-ships with Apple's Command Line Tools (3.9+).
+No third-party packages, no network calls. Works with the python3 that ships with
+Apple's Command Line Tools (3.9+).
 
 Commands
   python3 mac_sentinel_synthesis_scanner.py sample              Take one network snapshot (run every 15 min)
@@ -238,6 +240,41 @@ def cli_resolve(targets, resolve_flag=True):
 
 def shorten_home(p):
     return p.replace(HOME, "~", 1) if p and p.startswith(HOME) else p
+
+
+def require_not_root(command):
+    """install/uninstall write into *your* login session's LaunchAgents (gui/<uid>). Under sudo,
+    os.getuid() is 0, so they'd target root's session instead and silently do the wrong thing."""
+    if os.geteuid() == 0:
+        sys.exit(
+            "Run '%s' as yourself, without sudo — it needs to install into your own login session's "
+            "LaunchAgents, not root's.\nRe-run: python3 %s %s"
+            % (command, shorten_home(os.path.abspath(__file__)), command)
+        )
+
+
+def fix_sudo_ownership():
+    """If this ran under sudo (administrators sometimes do, for deeper log access — see README),
+    anything it just wrote under BASE_DIR now belongs to root. Hand it back to the real account so
+    a later run without sudo doesn't hit permission errors."""
+    if os.geteuid() != 0:
+        return
+    try:
+        uid, gid = int(os.environ.get("SUDO_UID", -1)), int(os.environ.get("SUDO_GID", -1))
+    except ValueError:
+        return
+    if uid < 0 or gid < 0:
+        return
+    for dirpath, dirnames, filenames in os.walk(BASE_DIR, onerror=lambda e: None):
+        for name in dirnames + filenames:
+            try:
+                os.chown(os.path.join(dirpath, name), uid, gid)
+            except OSError:
+                pass
+    try:
+        os.chown(BASE_DIR, uid, gid)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1185,6 +1222,7 @@ LABEL_REPORT = "com.macsentinelsynthesisscanner.report"
 
 
 def install(report_hour=7, interval_min=15):
+    require_not_root("install")
     script = os.path.abspath(__file__)
     py = sys.executable or "/usr/bin/python3"
     os.makedirs(AGENT_DIR, exist_ok=True)
@@ -1213,6 +1251,7 @@ def install(report_hour=7, interval_min=15):
 
 
 def uninstall():
+    require_not_root("uninstall")
     uid = os.getuid()
     for label in (LABEL_SAMPLE, LABEL_REPORT):
         path = os.path.join(AGENT_DIR, label + ".plist")
@@ -1415,6 +1454,7 @@ def main():
         if not targs:
             sys.exit("Specify one or more finding IDs or --all (e.g. `python3 mac_sentinel_synthesis_scanner.py resolve --all`).")
         cli_resolve(targs, resolve_flag=(args.cmd == "resolve"))
+        fix_sudo_ownership()
         return
     if sys.platform != "darwin":
         sys.exit("Mac Sentinel Synthesis Scanner only runs on macOS (use `demo` to preview the dashboard elsewhere).")
@@ -1435,6 +1475,7 @@ def main():
         uninstall()
     else:
         ap.print_help()
+    fix_sudo_ownership()
 
 
 TEMPLATE = r"""<!DOCTYPE html>

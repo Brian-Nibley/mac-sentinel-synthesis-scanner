@@ -1,9 +1,10 @@
 # Mac Sentinel Synthesis Scanner
 
 A single-file, dependency-free daily security report for macOS **standard (non-admin)**
-accounts. It reads what's already visible to a normal user — no `sudo`, no third-party
-Python packages, no network calls — and renders everything into one offline HTML
-dashboard.
+accounts. It reads what's already visible to a normal user — no `sudo` required, no
+third-party Python packages, no network calls — and renders everything into one offline
+HTML dashboard. Administrators can optionally run it with `sudo` for a couple of deeper
+checks; see ["Running as an administrator"](#running-as-an-administrator).
 
 Built for people who don't have admin rights on their own Mac (managed/work machines,
 shared family computers, etc.) but still want a daily sanity check on what's talking to
@@ -199,6 +200,32 @@ conversation with it.
    (`python3 mac_sentinel_synthesis_scanner.py report`) — the server has nothing to read until
    `latest.html` exists. After that, you can ask things like "check my Mac Sentinel findings" and
    your assistant will call `list_findings`, `get_finding`, or `report_summary` as needed.
+
+## Running as an administrator
+
+This is built for standard, non-admin accounts, so by default it quietly degrades a couple of
+checks instead of failing: the unified log and some endpoint-tool logs (Malwarebytes,
+Objective-See) are root-owned, so a standard account falls back to a lower-fidelity source
+(diagnostic reports instead of the unified log, process status instead of log contents).
+
+If you're an administrator and want those fuller checks, run **only** `report` (or `sample`) with
+`sudo` — nothing else needs to change:
+
+```bash
+sudo python3 mac_sentinel_synthesis_scanner.py report --open
+```
+
+A few things worth knowing:
+
+- **Don't run `install` or `uninstall` with sudo.** Those two write LaunchAgents into *your* login
+  session; under sudo they'd target root's session instead and do the wrong thing — the script
+  checks for this and refuses with a clear message if you try.
+- **You don't need sudo every time.** Use it occasionally when you want the deeper detail; the
+  rest of the time, run the script normally. Day-to-day automation (`install`) always runs as you,
+  not root, regardless of how you generate one-off reports.
+- **Ownership is handled for you.** Files `report`/`sample` write under
+  `~/MacSentinelSynthesisScanner` are automatically handed back to your own account when a sudo
+  run finishes, so a later non-sudo run won't hit "permission denied" on its own state files.
 
 ## Where data lives
 
