@@ -98,16 +98,61 @@ python3 mac_sentinel_synthesis_scanner.py demo --open
 | `install [--hour H] [--interval M]` | Install two **user-level** LaunchAgents (sampler + daily report) |
 | `uninstall`                    | Remove those LaunchAgents                                            |
 | `rebaseline`                   | Accept the current persistence items as the new "known good"         |
+| `resolve <ID...\|--all>`       | Mark finding(s) as resolved, so they stay hidden on future reports    |
+| `unresolve <ID...\|--all>`     | Reopen previously resolved finding(s)                                |
 | `demo [--out PATH] [--open]`   | Write a dashboard filled with sample data, for previewing the UI     |
 
 `install` only writes to `~/Library/LaunchAgents` (no `/Library`, no `sudo`) and can be
 fully undone with `uninstall`.
 
+## Tracking findings over time
+
+Every finding gets a stable ID (a short hash of its module, title, and evidence), so the
+same underlying issue is recognized across report runs rather than treated as new each
+time. For each finding, the dashboard tracks:
+
+- **First seen** — the date it first appeared.
+- **Days seen** — how many distinct days it's shown up.
+- **New today** — flagged when a finding's first-seen date is today.
+
+This state lives in `~/MacSentinelSynthesisScanner/state/findings_state.json` and is
+updated on every `report` run — nothing here needs any action from you.
+
+## Resolving findings ("dealt with")
+
+Once you've reviewed a finding and decided it's expected (or you've fixed it), you can
+mark it resolved so it drops out of future reports instead of nagging you daily. There
+are two ways to do this, and they end up in the same place:
+
+1. **From the terminal:**
+   ```bash
+   python3 mac_sentinel_synthesis_scanner.py resolve <ID>      # or --all
+   python3 mac_sentinel_synthesis_scanner.py unresolve <ID>    # reopen it
+   ```
+2. **From the report itself** — click **Resolve** on any finding. This is purely
+   client-side at first (saved to that browser's `localStorage`, so it survives closing
+   the tab or reloading), with a sync bar showing how many changes are pending. From
+   there, either:
+   - Click **"Save to Synthesis Scanner"**, which downloads a small
+     `mac-sentinel-synthesis-scanner-resolutions-<timestamp>.json` file to `~/Downloads`.
+     The *next* time you run the script (any command), it's picked up automatically,
+     merged into `findings_state.json`, and deleted — that's what actually makes a
+     resolution "stick" across report runs or other browsers/devices.
+   - Or click **"Copy Terminal command"** to copy the equivalent `resolve`/`unresolve`
+     command instead, if you'd rather not have a browser download anything.
+
+Because resolution state lives in `findings_state.json`, not inside any one HTML file,
+dismissing a finding is permanent for that finding's identity (module + title +
+evidence) — if the exact same issue is detected again later with different evidence
+(e.g. a different IP address), it's treated as a new finding.
+
 ## Where data lives
 
 Everything is stored under `~/MacSentinelSynthesisScanner/` (`reports/` and `state/`).
 Nothing is ever uploaded anywhere — there are no network calls in the collector or the
-report template.
+report template. Override the base directory with the `MAC_SENTINEL_SYNTHESIS_SCANNER_DIR`
+environment variable if you'd rather it live somewhere else (e.g. inside an encrypted
+volume).
 
 ## Known limitations
 

