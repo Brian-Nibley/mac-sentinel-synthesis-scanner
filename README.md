@@ -146,6 +146,60 @@ dismissing a finding is permanent for that finding's identity (module + title +
 evidence) — if the exact same issue is detected again later with different evidence
 (e.g. a different IP address), it's treated as a new finding.
 
+## Asking an AI about a finding
+
+The report's findings are deliberately brief one-liners. When you want more — "what does this
+actually mean, should I be worried?" — there are two ways to bring an AI assistant in, and neither
+makes the tool itself send anything over the network.
+
+### Copy for AI (works with anything, no setup)
+
+Every finding has a **Copy for AI** button next to Resolve. It copies a short, pre-formatted
+prompt — severity, area, title, detail, evidence, how long it's been seen, and your macOS version —
+to your clipboard, ready to paste into Claude, ChatGPT, or a search engine. It's just a richer
+version of what people already do by hand; nothing is sent anywhere until you paste it somewhere
+yourself.
+
+### MCP server (for Claude Desktop, Claude Code, or other MCP clients)
+
+If you already use an AI assistant that supports [MCP](https://modelcontextprotocol.io/) (Model
+Context Protocol), `mcp_server.py` lets it query your findings directly — "what are my
+high-severity findings and what do they mean?" — with full context, instead of you pasting
+anything in. There's no link to paste; MCP servers run locally and are wired up once in your AI
+client's own settings, not shared as a URL.
+
+It's read-only: it just parses the report data already embedded in
+`~/MacSentinelSynthesisScanner/latest.html` (whatever the last `report`/`rebaseline` run produced).
+It never runs a scan itself, never resolves or dismisses anything, and makes no network calls of
+its own — the only network traffic involved is between you and your AI client, same as any other
+conversation with it.
+
+**One-time setup:**
+
+1. Install the MCP SDK — the only part of this project with a third-party dependency, and only
+   needed for this optional feature:
+   ```bash
+   pip3 install mcp
+   ```
+2. Add an entry to your AI client's MCP config pointing at the real, absolute path to
+   `mcp_server.py` on your Mac. For Claude Desktop, that's
+   `~/Library/Application Support/Claude/claude_desktop_config.json` (create it if it doesn't
+   exist yet):
+   ```json
+   {
+     "mcpServers": {
+       "mac-sentinel-synthesis-scanner": {
+         "command": "python3",
+         "args": ["/absolute/path/to/mac-sentinel-synthesis-scanner/mcp_server.py"]
+       }
+     }
+   }
+   ```
+3. Restart your AI client, then run a report at least once if you haven't already
+   (`python3 mac_sentinel_synthesis_scanner.py report`) — the server has nothing to read until
+   `latest.html` exists. After that, you can ask things like "check my Mac Sentinel findings" and
+   your assistant will call `list_findings`, `get_finding`, or `report_summary` as needed.
+
 ## Where data lives
 
 Everything is stored under `~/MacSentinelSynthesisScanner/` (`reports/` and `state/`).
@@ -165,6 +219,9 @@ volume).
   heuristic, not a parser — it's tuned to avoid obvious false positives (e.g. matching
   "malware" inside the string "malwarebytes"), but new log formats from
   not-yet-tested tools may need similar tuning over time.
+- The optional `mcp_server.py` (see "Asking an AI about a finding") is the one piece of this
+  project with a third-party dependency (`pip install mcp`). The scanner and report itself
+  remain dependency-free whether or not you ever use it.
 
 ## License
 

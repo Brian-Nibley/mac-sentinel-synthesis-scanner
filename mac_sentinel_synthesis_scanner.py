@@ -1614,6 +1614,7 @@ td.act { width: 1%; white-space: nowrap; text-align: right; }
 }
 .act-btn:hover { color: var(--color-text); border-color: var(--color-text-faint); background: var(--color-surface-offset); }
 .act-btn.primary:hover { border-color: var(--color-primary); color: var(--color-primary); }
+.act-btn + .act-btn { margin-left: var(--space-2); }
 .sync-bar {
   display: grid; grid-template-columns: 1fr auto; gap: var(--space-2) var(--space-4); align-items: center;
   padding: var(--space-3) var(--space-5); margin-bottom: var(--space-6); border-radius: var(--radius-lg);
@@ -1896,9 +1897,11 @@ td.r, th.r { text-align: right; }
       sort: function (r) { return r.is_new ? "9999" : String(r.first_seen || ""); } });
     cols.push({ label: "Evidence", key: "evidence", cls: "clip", render: function (r) { return '<span class="mono" title="' + esc(r.evidence) + '">' + esc(r.evidence || "—") + "</span>"; } });
     cols.push({ label: "", key: "id", cls: "act", render: function (r) {
-      return isResolved(r)
+      var resolveBtn = isResolved(r)
         ? '<button class="act-btn" data-reopen="' + esc(r.id) + '" aria-label="Reopen: ' + esc(r.title) + '">Reopen</button>'
         : '<button class="act-btn primary" data-resolve="' + esc(r.id) + '" aria-label="Mark resolved: ' + esc(r.title) + '">Resolve</button>';
+      var aiBtn = '<button class="act-btn" data-copyai="' + esc(r.id) + '" aria-label="Copy a prompt to ask an AI about: ' + esc(r.title) + '">Copy for AI</button>';
+      return resolveBtn + aiBtn;
     } });
     return table(cols, list, resolvedView ? "Nothing resolved yet" : "No open findings",
       resolvedView ? " Findings you mark as resolved appear here and stay hidden from future reports." : " Nothing in this area needs attention.");
@@ -2214,6 +2217,37 @@ td.r, th.r { text-align: right; }
     else fallback();
   }
 
+  function aiPrompt(r) {
+    var lines = [
+      "I'm looking at a finding from the Mac Sentinel Synthesis Scanner, an offline macOS security report. " +
+        "Please explain in plain language what this likely means, how concerned I should be, and what (if " +
+        "anything) I should do about it.",
+      "",
+      "Severity: " + r.severity,
+      "Area: " + (MOD_NAME[r.module] || r.module),
+      "Finding: " + r.title
+    ];
+    if (r.detail) lines.push("Detail: " + r.detail);
+    if (r.evidence) lines.push("Evidence: " + r.evidence);
+    lines.push("First seen: " + fmtDay(r.first_seen) + " (" + (r.days_seen || 1) + (r.days_seen === 1 ? " day" : " days") + " seen so far)");
+    lines.push("", "macOS " + (meta.macos_version || "unknown version") + ". This was found by a local, offline scan — nothing has been sent anywhere.");
+    return lines.join("\n");
+  }
+
+  function copyForAI(id, btn) {
+    var f = BY_ID[id];
+    if (!f) return;
+    var txt = aiPrompt(f);
+    function done() { btn.textContent = "Copied"; }
+    function fallback() {
+      var ta = document.createElement("textarea"); ta.value = txt; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); done(); } catch (e) { window.prompt("Copy this text:", txt); }
+      ta.remove();
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done, fallback);
+    else fallback();
+  }
+
   renderAll();
   document.getElementById("meta").innerHTML =
     "<span>Host <b>" + esc(meta.hostname) + "</b></span><span>User <b>" + esc(meta.user) + "</b></span><span>macOS <b>" + esc(meta.macos_version) +
@@ -2237,6 +2271,8 @@ td.r, th.r { text-align: right; }
     if (r) { setResolved(r.getAttribute("data-resolve"), true); return; }
     var o = e.target.closest("[data-reopen]");
     if (o) { setResolved(o.getAttribute("data-reopen"), false); return; }
+    var ca = e.target.closest("[data-copyai]");
+    if (ca) { copyForAI(ca.getAttribute("data-copyai"), ca); return; }
     if (e.target.closest("#sync-save")) { saveFile(); return; }
     var cp = e.target.closest("#sync-copy");
     if (cp) { copyCmd(cp); return; }
